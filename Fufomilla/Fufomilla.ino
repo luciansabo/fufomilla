@@ -1,24 +1,31 @@
 /*
+
    Fufomilla - cat feeder
    Board: ESP32 Dev module
    Minimal SPIFFS
-   PSRAM Disabled -> imcopatible with DS1302 RTC module
-   Arduino core/events run on Core 1
-   Webserver for camera task runs on Core 0
+   PSRAM Disabled -> incompatible with DS1302 RTC module
+   Arduino run on Core 1, events on Core 2
 */
 
 #include <ESP32Servo.h>
 #include <WiFiManager.h>
 #include <PubSubClient.h> // MQTT Client
 #include <ArduinoOTA.h>
-#include <WebServer.h>
-#include <WiFiClient.h>
 #include <ESPmDNS.h>
 #include <time.h>
 #include <CronAlarms.h>
 #include <SimpleTimer.h> // https://playground.arduino.cc/Code/SimpleTimer/
 
 #include "logging.h"
+
+// ESP32 needs EEPROM
+#if defined(ESP32)
+  #define USE_SPIFFS            true
+  #define ESP_DRD_USE_EEPROM    true
+#else
+  #error This code is intended to run on the ESP32 platform! Please check your Tools->Board setting.
+#endif
+#include <ESP_DoubleResetDetector.h>      //https://github.com/khoih-prog/ESP_DoubleResetDetector
 
 // app config
 #include "config.h"
@@ -37,6 +44,8 @@ ThreeWire threeWire(PIN_RTC_DAT, PIN_RTC_CLK, PIN_RTC_RST); // IO, SCLK, CE
 RtcDS1302<ThreeWire> rtc(threeWire);
 #endif
 
+DoubleResetDetector* drd;
+
 // network
 WiFiClient espClient;
 unsigned long wifiReconnectTime = 0;
@@ -46,74 +55,45 @@ PubSubClient mqtt(espClient);
 bool isManualDispense = false;
 
 #ifdef HAS_CAMERA
-//#include "esp_camera.h"
-#include "src/camera/OV2640.h"
-#include "src/camera/camera_pins.h"
-OV2640 cam;
-WebServer webserver(80);
-TaskHandle_t webserverTaskHandle;
+#include "Esp32CamAsyncWebserver.h"
+camera_config_t esp32cam_aithinker_config {
 
-const char HEADER[] = "HTTP/1.1 200 OK\r\n" \
-                      "Access-Control-Allow-Origin: *\r\n" \
-                      "Content-Type: multipart/x-mixed-replace; boundary=123456789000000000000987654321\r\n";
-const char BOUNDARY[] = "\r\n--123456789000000000000987654321\r\n";
-const char CTNTTYPE[] = "Content-Type: image/jpeg\r\nContent-Length: ";
-const int hdrLen = strlen(HEADER);
-const int bdrLen = strlen(BOUNDARY);
-const int cntLen = strlen(CTNTTYPE);
+    .pin_pwdn = 32,
+    .pin_reset = -1,
 
-void handleJpgStream(void)
-{
-  char buf[32];
-  int s;
+    .pin_xclk = 0,
 
-  WiFiClient client = webserver.client();
+    .pin_sscb_sda = 26,
+    .pin_sscb_scl = 27,
 
-  client.write(HEADER, hdrLen);
-  client.write(BOUNDARY, bdrLen);
+    // Note: LED GPIO is apparently 4 not sure where that goes
+    // per https://github.com/donny681/ESP32_CAMERA_QR/blob/e4ef44549876457cd841f33a0892c82a71f35358/main/led.c
+    .pin_d7 = 35,
+    .pin_d6 = 34,
+    .pin_d5 = 39,
+    .pin_d4 = 36,
+    .pin_d3 = 21,
+    .pin_d2 = 19,
+    .pin_d1 = 18,
+    .pin_d0 = 5,
+    .pin_vsync = 25,
+    .pin_href = 23,
+    .pin_pclk = 22,
+    .xclk_freq_hz = 20000000, // faster fps
+    .ledc_timer = LEDC_TIMER_1,
+    .ledc_channel = LEDC_CHANNEL_1,
+    .pixel_format = PIXFORMAT_JPEG,
+    // .frame_size = FRAMESIZE_UXGA, // needs 234K of framebuffer space
+    // .frame_size = FRAMESIZE_SXGA, // needs 160K for framebuffer
+    // .frame_size = FRAMESIZE_XGA, // needs 96K or even smaller FRAMESIZE_SVGA - can work if using only 1 fb
+    .frame_size = FRAMESIZE_QVGA, // 240x176
+    .jpeg_quality = 15, //0-63 lower numbers are higher quality
+    .fb_count = 1,       // if more than one i2s runs in continous mode.  Use only with jpeg
+    .fb_location = CAMERA_FB_IN_DRAM, // disable PSRAM 
+    .grab_mode = CAMERA_GRAB_WHEN_EMPTY
+};
 
-  while (true)
-  {        
-    if (!client.connected()) break;
-    cam.run();
-    s = cam.getSize();
-    client.write(CTNTTYPE, cntLen);
-    sprintf( buf, "%d\r\n\r\n", s );
-    client.write(buf, strlen(buf));
-    client.write((char *)cam.getfb(), s);
-    client.write(BOUNDARY, bdrLen);
-  }
-}
-
-const char JHEADER[] = "HTTP/1.1 200 OK\r\n" \
-                       "Content-disposition: inline; filename=capture.jpg\r\n" \
-                       "Content-type: image/jpeg\r\n\r\n";
-const int jhdLen = strlen(JHEADER);
-
-// ------------------------------------------------------------------------------------------
-
-void handleJpg(void)
-{
-  WiFiClient client = webserver.client();
-
-  if (!client.connected()) return;    
-  cam.run();
-  client.write(JHEADER, jhdLen);
-  client.write((char *)cam.getfb(), cam.getSize());
-}
-
-// ------------------------------------------------------------------------------------------
-
-void handleNotFound()
-{  
-  webserver.send(404, "text/plain", "Not found");
-}
-
-void webserverTask(void * parameter) {
-  for(;;) {
-    webserver.handleClient(); 
-  }
-}
+Esp32CamWebserver camServer;
 #endif
 
 // software timer
@@ -144,37 +124,32 @@ struct TStats {
   char lastOperation[100];
 } stats;
 
-void LOG(EventCode code) {
-  //time_t tnow = time(nullptr);
-  //logs.push(logRecord{tnow, code});
-  //Serial.println(code);
-}
-
+// ------------------------------------------------------------------------------------------
 
 void setupOTA() {
   ArduinoOTA.setHostname(HOSTNAME);
   ArduinoOTA.begin();
   ArduinoOTA.onStart([]() {
-    Serial.println("OTA firmware update started");
+    log_i("OTA firmware update started");
     //hwTimer.disableTimer();
   });
   ArduinoOTA.onEnd([]() {
-    Serial.println("OTA Updated completed");
+    log_i("OTA Updated completed");
     // hwTimer.enableTimer();
   });
   ArduinoOTA.onError([](ota_error_t error) {
     //hwTimer.enableTimer();
-    Serial.printf("Error[%u]: ", error);
+    log_e("Error[%u]: ", error);
     if (error == OTA_AUTH_ERROR) {
-      Serial.println("Auth Failed");
+      log_e("Auth Failed");
     } else if (error == OTA_BEGIN_ERROR) {
-      Serial.println("Begin Failed");
+      log_e("Begin Failed");
     } else if (error == OTA_CONNECT_ERROR) {
-      Serial.println("Connect Failed");
+      log_e("Connect Failed");
     } else if (error == OTA_RECEIVE_ERROR) {
-      Serial.println("Receive Failed");
+      log_e("Receive Failed");
     } else if (error == OTA_END_ERROR) {
-      Serial.println("End Failed");
+      log_e("End Failed");
     }
   });
 }
@@ -185,12 +160,8 @@ void setupOTA() {
 void mqttPublish(const char *topic, const char *message, bool retain = false) {
   ensureMqttConnected();
 
-  if (!mqtt.publish(topic, message, retain)) {
-    LOG(EventCode::mqttPublishError);
-    Serial.println("MQTT Publish failed." );
-    Serial.printf("  Topic: %s\n", topic);
-    Serial.printf("  Msg: %s\n", message);
-    Serial.printf("  State: %d\n", mqtt.state());
+  if (!mqtt.publish(topic, message, retain)) {    
+    log_e("MQTT Publish failed. Topic: %s\nMsg: %s\nState: %d", topic,  message, mqtt.state());    
   }
 }
 
@@ -205,28 +176,24 @@ void ensureMqttConnected() {
     return;
   }
 
-  LOG(EventCode::mqttDisconnected);
-
-  Serial.print("Connecting to the mqtt broker... ");
+  log_i("Connecting to the mqtt broker... ");
 
   if (mqtt.connect(HOSTNAME, mqttConfig.username, mqttConfig.password, TOPIC_AVAILABILITY, 0, true, "{\"status\": \"offline\", \"upSince\": null}")) {
-    Serial.print("connected");
-    mqtt.subscribe(TOPIC_COMMAND_FEED_ME);
-    LOG(EventCode::mqttConnected);
+    log_i("Connected to MQTT");
+    mqtt.subscribe(TOPIC_COMMAND_FEED_ME);    
+    mqtt.subscribe(TOPIC_COMMAND_SWITCH_LED);    
+
     char message[200];
     //char timeBuf[sizeof "2011-10-08T07:07:09Z"];
     //strftime(timeBuf, sizeof timeBuf, "%FT%TZ", localtime(&stats.upSince));
     char timeBuf[sizeof "Joi, 30 Aug 2022 09:03"];
     strftime(timeBuf, sizeof timeBuf, "%a, %e %b %Y %R", localtime(&stats.upSince));
     sprintf(message, "{\"status\": \"online\",  \"upSince\": \"%s\"}", timeBuf);
-    Serial.println(message);
+    log_i("Publish availability message: %s", message);
     mqttPublish(TOPIC_AVAILABILITY, message, true);
   } else {
-    LOG(EventCode::mqttConnectFrror);
-    Serial.print("failed with state ");
-    Serial.print(mqtt.state());
-  }
-  Serial.println("");
+    log_e("failed with state %d", mqtt.state());    
+  }  
 }
 
 // ------------------------------------------------------------------------------------------
@@ -245,9 +212,9 @@ void _dispenseMinPortion() {
 }
 
 // ------------------------------------------------------------------------------------------
-void onDispenseStart() {
+/*void onDispenseStart() {
   
-}
+}*/
 
 // ------------------------------------------------------------------------------------------
 
@@ -273,20 +240,17 @@ void onDispenseCompleted() {
 // ------------------------------------------------------------------------------------------
 
 void dispense() {
-  onDispenseStart();
-  Serial.println("Scheduled dispense");
-  _dispenseMinPortion();
-  delay(200);
-  _dispenseMinPortion();
-
+  //onDispenseStart();
+  log_i("Scheduled dispense");
+  _dispenseMinPortion();  
   onDispenseCompleted();
 }
 
 // ------------------------------------------------------------------------------------------
 
 void manualDispense() {
-  onDispenseStart();
-  Serial.println("Manually Dispensing");
+  //onDispenseStart();
+  log_i("Manually Dispensing");
   isManualDispense = true;
   _dispenseMinPortion();
 
@@ -296,55 +260,79 @@ void manualDispense() {
 
 // ------------------------------------------------------------------------------------------
 
-void mqttCallback(char* topic, byte* message, unsigned int length) {
-  Serial.printf("Message arrived on topic: %s\n", topic);  
+void publishNightLedStatus() {
+  char message[100];
+  sprintf(message, "{\"status\": \"%s\"}",
+    digitalRead(PIN_BRIGHT_LED) ? "ON" : "OFF"
+  );
 
-  // If a message is received on the topic esp32/output, you check if the message is either "on" or "off".
-  // Changes the output state according to the message
+  mqttPublish(TOPIC_LED, message, true);
+}
+
+// ------------------------------------------------------------------------------------------
+
+void turnLedOn() {
+  digitalWrite(PIN_BRIGHT_LED, HIGH);
+  publishNightLedStatus();
+}
+
+// ------------------------------------------------------------------------------------------
+
+void turnLedOff() {
+  digitalWrite(PIN_BRIGHT_LED, LOW);
+  publishNightLedStatus();
+}
+
+
+// ------------------------------------------------------------------------------------------
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  log_i("Message arrived on topic: %s", topic);  
+  
   if (String(topic) == TOPIC_COMMAND_FEED_ME) {
     manualDispense();
+  } else if (String(topic) == TOPIC_COMMAND_SWITCH_LED) {      
+    char message[100];
+    strncpy(message, (char *)payload, length);
+
+    if (strcmp(message, "ON") == 0) {
+      turnLedOn();
+    } else {
+      turnLedOff();
+    }
   }
 }
 
 // ------------------------------------------------------------------------------------------
 
 void WiFiStationConnected(WiFiEvent_t event, WiFiEventInfo_t info) {
-  Serial.println("Connected to AP successfully!");
+  log_i("Connected to AP successfully");
   wifiReconnectTime = 0;
 }
 
 // ------------------------------------------------------------------------------------------
 
 void WiFiGotIP(WiFiEvent_t event, WiFiEventInfo_t info) {
-  Serial.println("WiFi connected");
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
+  log_i("WiFi connected. IP address: %s", WiFi.localIP().toString().c_str());  
   ensureMqttConnected();
 }
 
 // ------------------------------------------------------------------------------------------
 
 void wifiReconnect() {
-  Serial.println("Trying to Reconnect to Wifi");
+  log_i("Trying to Reconnect to Wifi");
   WiFi.disconnect();
   Cron.delay(5000);
   WiFi.reconnect();
 }
 // ------------------------------------------------------------------------------------------
 
-/**
-   Wifi will try to connect as soon as it gets disconnected. It tries for 20 sec
-   Then it aborts.
-   Waits for 5s before each attempt
-   Finally, a watchdog set at 5 mins will retry if still not connected
-
-*/
 void WiFiStationDisconnected(WiFiEvent_t event, WiFiEventInfo_t info) {
   if (millis() - wifiReconnectTime > 20 * 1000) {
     return;
   }
 
-  Serial.printf("WiFi lost connection.\n");
+  log_w("WiFi lost connection.\n");
   wifiReconnectTime = millis();
   wifiReconnect();
 }
@@ -370,6 +358,15 @@ void publishMQTTDiscoveryMessages() {
            TOPIC_COMMAND_FEED_ME
           );
   mqttPublish("homeassistant/button/fufomilla/feedMe/config" , message, true);
+
+  // Switch Night Vision LED command
+  snprintf(message, sizeof(message), "{\"name\": \"Fufomilla night vision LED\", %s, \"dev_cla\": \"switch\", \"cmd_t\": \"%s\", \"stat_t\": \"%s\", \"val_tpl\": \"{{ value_json.status}}\", \"frc_upd\": true }",
+           availText,
+           TOPIC_COMMAND_SWITCH_LED,
+           TOPIC_LED
+          );
+  mqttPublish("homeassistant/switch/fufomilla/led/config" , message, true);  
+   
 
 #ifdef HAS_FOOD_LEVEL_SENSOR
   // Food Level percentage
@@ -414,220 +411,28 @@ void setupRTC() {
     //    1) first time you ran and the device wasn't running yet
     //    2) the battery on the device is low or even missing
 
-    Serial.println("RTC lost confidence in the DateTime!");
+    log_w("RTC lost confidence in the DateTime!");
     rtc.SetDateTime(RtcDateTime(__DATE__, __TIME__));
   }
 
   if (rtc.GetIsWriteProtected()) {
-    Serial.println("RTC was write protected, enabling writing now");
+    log_w("RTC was write protected, enabling writing now");
     rtc.SetIsWriteProtected(false);
   }
 
   if (!rtc.GetIsRunning()) {
-    Serial.println("RTC was not actively running, starting now");
+    log_w("RTC was not actively running, starting now");
     rtc.SetIsRunning(true);
   }
 }
 #endif
 // ------------------------------------------------------------------------------------------
 
-void setup() {
-  Serial.begin(115200);
-  LOG(EventCode::deviceOn);
-#ifdef DEBUG
-  while (!Serial); // wait for Arduino Serial Monitor
-#endif
-
-  Serial.println("Fufomilla Feeder is starting");
-  pinMode(PIN_BRIGHT_LED, OUTPUT);
-  pinMode(PIN_BUILTIN_LED, OUTPUT);
-  
-  digitalWrite(PIN_BRIGHT_LED, LOW);
-  digitalWrite(PIN_BUILTIN_LED, HIGH);
-
-#ifdef HAS_RTC
-  setupRTC();
-  RtcDateTime now = rtc.GetDateTime();  
-  if (now.IsValid()) {
-    struct timeval cTimeNow;
-    cTimeNow.tv_sec = now.Epoch64Time();
-    settimeofday(&cTimeNow, NULL);
-  }
-  printLocalTime();
-#endif
-
-
-  WiFi.mode(WIFI_STA); // explicitly set mode, esp defaults to STA+AP
-
-  // Allow allocation of all timers
-  ESP32PWM::allocateTimer(0);
-  ESP32PWM::allocateTimer(1);
-  ESP32PWM::allocateTimer(2);
-  ESP32PWM::allocateTimer(3);
-  myservo.setPeriodHertz(50);    // standard 50 hz servo
-  // using default min/max of 1000us and 2000us
-  myservo.attach(PIN_SERVO, 1000, 2000);
-
-  wifiManager.setHostname(HOSTNAME);
-  wifiManager.setWiFiAutoReconnect(true);
-  wifiManager.setConnectTimeout(WIFI_CONNECT_TIMEOUT_SEC);
-  wifiManager.setConnectRetries(3);
-  wifiManager.setDebugOutput(false);
-  wifiManager.setEnableConfigPortal(false);
-  wifiManager.setConfigPortalBlocking(true);
-  wifiManager.setConfigPortalTimeout(CONFIG_PORTAL_TIMEOUT_SEC);
-  //wifiManager.setSaveConfigCallback(saveConfigCallback);
-  wifiManager.setBreakAfterConfig(true); // call save callback even if empty wifi or failed
-  // custom params
-  wifiManager.addParameter(&paramMqttBroker);
-  wifiManager.addParameter(&paramMqttPort);
-  wifiManager.addParameter(&paramMqttUsername);
-  wifiManager.addParameter(&paramMqttPassword);
-  Serial.println("Connecting to Wifi...");
-  wifiManager.autoConnect();
-
-  // must be before logging starts
-  configTzTime(TIME_TZ, TIME_NTP_SERVER);
-
-  struct tm timeinfo;
-  getLocalTime(&timeinfo);
-
-#ifndef HAS_RTC
-  // wait until we have acquired the time
-  while (!getLocalTime(&timeinfo)) {
-    delay(100);
-  }
-#endif
-
-  stats.upSince = mktime(&timeinfo);
-
-  mqtt.setServer(mqttConfig.broker, atoi(mqttConfig.port));
-  mqtt.setKeepAlive(MQTT_KEEP_ALIVE_SEC);
-  mqtt.setCallback(mqttCallback);
-  mqtt.setBufferSize(512); // increase/double buffer size so larger messages can be sent without reallocation
-  ensureMqttConnected();
-
-  WiFi.onEvent(WiFiStationConnected, WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_CONNECTED);
-  WiFi.onEvent(WiFiGotIP, WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_GOT_IP);
-  WiFi.onEvent(WiFiStationDisconnected, WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
-
-  setupOTA();   
-
-  // wifi watchdog at every 5 min
-  Cron.create((char*)"0 */5 * * * *", wifiWatchdog, false);
-
-  // setup feeeding schedule
-  Cron.create((char*)"0 0 7 * * *", dispense, false); // 07:00 each day
-  Cron.create((char*)"0 0 19 * * *", dispense, false); // 19:00 each day
-
-  publishMQTTDiscoveryMessages();
-
-#ifdef HAS_FOOD_LEVEL_SENSOR
-  simpleTimer.setTimeout(FOOD_LEVEL_READING_INTERVAL, readFoodLevel);
-  readFoodLevel();
-#endif
-
-  // 10s wifi check
-  simpleTimer.setInterval(10 * 1000, []() {
-    digitalWrite(PIN_BUILTIN_LED, WiFi.status() == WL_CONNECTED);
-  });
-
-#ifdef HAS_RTC
-  simpleTimer.setInterval(RTC_SYNC_INTERVAL_WITH_NTC, []() {
-    // adjust RTC time from NTP
-    RtcDateTime utc;
-    utc.InitWithEpoch64Time(time(NULL));
-    rtc.SetDateTime(utc);
-    RtcDateTime now = rtc.GetDateTime();
-  });
-#endif 
-
-#ifdef HAS_CAMERA    
-  initCamera();
-  webserver.on("/mjpeg/1", HTTP_GET, handleJpgStream);
-  webserver.on("/jpg", HTTP_GET, handleJpg);
-  webserver.onNotFound(handleNotFound);
-  webserver.begin();  
-
-  if(!MDNS.begin(HOSTNAME)) {
-     Serial.println("Error encountered while starting mDNS");
-     return;
-  }
-
-  xTaskCreatePinnedToCore(
-    webserverTask,   // function
-    "webserverTask",     // task name
-    10000,       // stack size
-    NULL,        // params
-    2,           // priority
-    // when priority was set to 100 then network scan would not complete
-    &webserverTaskHandle,      // Task handle to keep track of created task
-    0 // core number
-  );
-#endif
-
-  //LOG(EventCode::deviceReady);
-}
-
-// ------------------------------------------------------------------------------------------
-
-void initCamera() {     
-  camera_config_t config;
-  config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer = LEDC_TIMER_0;
-  config.pin_d0 = Y2_GPIO_NUM;
-  config.pin_d1 = Y3_GPIO_NUM;
-  config.pin_d2 = Y4_GPIO_NUM;
-  config.pin_d3 = Y5_GPIO_NUM;
-  config.pin_d4 = Y6_GPIO_NUM;
-  config.pin_d5 = Y7_GPIO_NUM;
-  config.pin_d6 = Y8_GPIO_NUM;
-  config.pin_d7 = Y9_GPIO_NUM;
-  config.pin_xclk = XCLK_GPIO_NUM;
-  config.pin_pclk = PCLK_GPIO_NUM;
-  config.pin_vsync = VSYNC_GPIO_NUM;
-  config.pin_href = HREF_GPIO_NUM;
-  config.pin_sscb_sda = SIOD_GPIO_NUM;
-  config.pin_sscb_scl = SIOC_GPIO_NUM;
-  config.pin_pwdn = PWDN_GPIO_NUM;
-  config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
-  config.pixel_format = PIXFORMAT_JPEG;
-
-  // Frame parameters
-  //  config.frame_size = FRAMESIZE_UXGA;
-  config.frame_size = FRAMESIZE_QVGA;
-  config.jpeg_quality = 10;
-  config.fb_count = 1;
-  config.fb_location = CAMERA_FB_IN_DRAM;
-
-  cam.init(config);
-}
-
-/*
-  #define countof(a) (sizeof(a) / sizeof(a[0]))
-  void printDateTime(const RtcDateTime& dt)
-  {
-    char datestring[20];
-
-    snprintf_P(datestring,
-            countof(datestring),
-            PSTR("%02u/%02u/%04u %02u:%02u:%02u"),
-            dt.Month(),
-            dt.Day(),
-            dt.Year(),
-            dt.Hour(),
-            dt.Minute(),
-            dt.Second() );
-    Serial.print(datestring);
-  }*/
-
-// ------------------------------------------------------------------------------------------
 #ifdef HAS_FOOD_LEVEL_SENSOR
 void readFoodLevel() {
   char message[200];
   int distance = distanceSensor.measureDistanceCm();
-  Serial.println(distance);
+  log_i("Read food level distance: %d cm", distance);
   if (distance <= 0) {
     return;
   }
@@ -648,23 +453,172 @@ void readFoodLevel() {
 }
 #endif
 
+
 // ------------------------------------------------------------------------------------------
 
-void printLocalTime() {
-  struct tm timeinfo;
-  if (!getLocalTime(&timeinfo)) {
-    Serial.println("Failed to obtain time");
-    return;
+void doWiFiManager() {
+  // is configuration portal requested?  
+  
+  if (drd->detectDoubleReset()) {
+    log_i("Starting Config Portal");
+    // important - disable webserver to be able to use the config portal routes
+    camServer.disable();    
+    wifiManager.setEnableConfigPortal(true);
+    wifiManager.startConfigPortal(CONFIG_PORTAL_AP_NAME, CONFIG_PORTAL_AP_PASS);
+    wifiManager.setEnableConfigPortal(false);       
+    camServer.enable();      
   }
-  Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
 }
 
+// ------------------------------------------------------------------------------------------
+
+
+void setup() {  
+
+  log_i("Fufomilla Feeder is starting");
+  
+  pinMode(PIN_BRIGHT_LED, OUTPUT);    
+  digitalWrite(PIN_BRIGHT_LED, LOW);
+  drd = new DoubleResetDetector(DRD_TIMEOUT, DRD_ADDRESS);  
+  doWiFiManager();
+
+#ifdef HAS_RTC
+  log_i("Initialize RTC module");
+  setupRTC();
+  RtcDateTime now = rtc.GetDateTime();  
+  if (now.IsValid()) {
+    char datestring[20];
+
+    snprintf_P(datestring, 
+            sizeof(datestring),
+            PSTR("%02u/%02u/%04u %02u:%02u:%02u"),
+            now.Month(),
+            now.Day(),
+            now.Year(),
+            now.Hour(),
+            now.Minute(),
+            now.Second()
+            );
+            
+    log_i("RTC time: %s", datestring);
+    
+    struct timeval cTimeNow;
+    cTimeNow.tv_sec = now.Epoch64Time();
+    settimeofday(&cTimeNow, NULL);
+  } else {
+    log_w("Invalid RTC time");
+  }  
+#endif
+
+  WiFi.mode(WIFI_STA); // explicitly set mode, esp defaults to STA+AP
+
+  // Allow allocation of all timers
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+  myservo.setPeriodHertz(50);    // standard 50 hz servo
+  // using default min/max of 1000us and 2000us
+  myservo.attach(PIN_SERVO, 1000, 2000);
+
+  wifiManager.setHostname(HOSTNAME);
+  wifiManager.setWiFiAutoReconnect(true);
+  wifiManager.setConnectTimeout(WIFI_CONNECT_TIMEOUT_SEC);
+  wifiManager.setConnectRetries(10);
+  wifiManager.setDebugOutput(false);
+  wifiManager.setEnableConfigPortal(false);
+  wifiManager.setConfigPortalBlocking(true);
+  wifiManager.setConfigPortalTimeout(CONFIG_PORTAL_TIMEOUT_SEC);
+  //wifiManager.setSaveConfigCallback(saveConfigCallback);
+  wifiManager.setBreakAfterConfig(true); // call save callback even if empty wifi or failed
+  // custom params
+  wifiManager.addParameter(&paramMqttBroker);
+  wifiManager.addParameter(&paramMqttPort);
+  wifiManager.addParameter(&paramMqttUsername);
+  wifiManager.addParameter(&paramMqttPassword);
+  log_i("Connecting to Wifi...");
+  wifiManager.autoConnect();
+
+  log_i("Trying to sync time with NTP");
+  // must be before logging starts
+  configTzTime(TIME_TZ, TIME_NTP_SERVER);
+
+  struct tm timeinfo;
+  getLocalTime(&timeinfo);
+
+  // wait until we have acquired the time
+  while (!getLocalTime(&timeinfo)) {
+    delay(100);
+  }
+  log_i("Successfully aquired time using NTP: %s", asctime(&timeinfo));
+
+  stats.upSince = mktime(&timeinfo);  
+
+  mqtt.setServer(mqttConfig.broker, atoi(mqttConfig.port));
+  mqtt.setKeepAlive(MQTT_KEEP_ALIVE_SEC);
+  mqtt.setCallback(mqttCallback);
+  mqtt.setBufferSize(512); // increase/double buffer size so larger messages can be sent without reallocation
+  ensureMqttConnected();
+
+  WiFi.onEvent(WiFiStationConnected, WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_CONNECTED);
+  WiFi.onEvent(WiFiGotIP, WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_GOT_IP);
+  WiFi.onEvent(WiFiStationDisconnected, WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+
+  setupOTA();   
+   
+  simpleTimer.setInterval(WIFI_WATCHDOG_INTERVAL, wifiWatchdog);
+  simpleTimer.setInterval(MQTT_WATCHDOG_INTERVAL, ensureMqttConnected);
+  simpleTimer.setInterval(MQTT_HANDLING_INTERVAL, []() {mqtt.loop();});
+
+  // setup feeeding schedule
+  Cron.create((char*)"0 0 7 * * *", dispense, false); // 07:00 each day
+  Cron.create((char*)"0 0 19 * * *", dispense, false); // 19:00 each day
+
+  publishMQTTDiscoveryMessages();
+
+#ifdef HAS_FOOD_LEVEL_SENSOR
+  simpleTimer.setTimeout(FOOD_LEVEL_READING_INTERVAL, readFoodLevel);
+  readFoodLevel();
+#endif
+
+  publishNightLedStatus();
+
+#ifdef HAS_RTC
+  simpleTimer.setInterval(RTC_SYNC_INTERVAL_WITH_NTC, []() {
+    log_i("Sync RTC module with NTP time");
+    // adjust RTC time from NTP
+    RtcDateTime utc;
+    utc.InitWithEpoch64Time(time(NULL));
+    rtc.SetDateTime(utc);
+    RtcDateTime now = rtc.GetDateTime();
+  });
+#endif 
+
+  #ifdef HAS_CAMERA    
+    log_i("Initialize camera server");    
+    camServer.start(esp32cam_aithinker_config);  
+  #endif
+
+  log_i("Initialize MDNS");
+  if (!MDNS.begin(HOSTNAME)) {
+     log_e("Error encountered while starting mDNS");     
+  }
+}
 
 // ------------------------------------------------------------------------------------------
 
-void loop() {
-  mqtt.loop();
+void loop() {   
   ArduinoOTA.handle();
   simpleTimer.run();
   Cron.delay(0);
+  
+  #ifdef HAS_CAMERA
+  camServer.run(); 
+  #endif 
+
+  // Call the double reset detector loop method every so often,
+  // so that it can recognise when the timeout expires.
+  // You can also call drd.stop() when you wish to no longer
+  // consider the next reset as a double reset.
+  drd->loop();
 }
