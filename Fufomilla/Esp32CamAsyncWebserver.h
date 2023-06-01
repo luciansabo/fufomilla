@@ -37,80 +37,79 @@
 #include <driver/rtc_io.h>
 
 // ESP32 has two cores: APPlication core and PROcess core (the one that runs ESP32 SDK stack)
-#define MAX_CLIENTS   3
+#define MAX_CLIENTS 3
 
-class Esp32CamWebserver
-{
-public:    
-    Esp32CamWebserver() {        
-        this->webserver = new WebServer(80);
-    };
-    ~Esp32CamWebserver() {
-        delete this->webserver;
-    };
-   
-    WebServer* start(camera_config_t cameraConfig);
-    void run(void);
-    void disable(void);
-    void enable(void);
+class Esp32CamWebserver {
+public:
+  Esp32CamWebserver() {
+    this->webserver = new WebServer(80);
+  };
+  ~Esp32CamWebserver() {
+    delete this->webserver;
+  };
+
+  WebServer* start(camera_config_t cameraConfig);
+  void run(void);
+  void disable(void);
+  void enable(void);
 
 protected:
-    WebServer *webserver;
+  WebServer* webserver;
 
 private:
-    static char* allocateMemory(char* aPtr, size_t aSize);
-    static void mjpegCB(void* pvParameters);
-    static void camCB(void* pvParameters);
-    static void streamCB(void * pvParameters);
-    void handleJpg(void);
-    void handleMjpeg(void);        
-    void handleNotFound(void);    
-    
-    camera_config_t _camConfig;
+  static char* allocateMemory(char* aPtr, size_t aSize);
+  static void mjpegCB(void* pvParameters);
+  static void camCB(void* pvParameters);
+  static void streamCB(void* pvParameters);
+  void handleJpg(void);
+  void handleMjpeg(void);
+  void handleNotFound(void);
 
-    // ===== rtos task handles =========================
-    // Streaming is implemented with 3 tasks:
-    TaskHandle_t tMjpeg;   // handles client connections to the webserver
-    TaskHandle_t tCam;     // handles getting picture frames from the camera and storing them locally
+  camera_config_t _camConfig;
 
-    volatile uint32_t frameNumber;
-    volatile size_t   camSize;    // size of the current frame, byte
-    volatile char*    camBuf;      // pointer to the current frame
-    uint8_t       noActiveClients;       // number of active clients
-    // frameSync semaphore is used to prevent streaming buffer as it is replaced with the next frame
-    SemaphoreHandle_t frameSync = NULL;
+  // ===== rtos task handles =========================
+  // Streaming is implemented with 3 tasks:
+  TaskHandle_t tMjpeg;  // handles client connections to the webserver
+  TaskHandle_t tCam;    // handles getting picture frames from the camera and storing them locally
 
-    static const int APP_CPU = 1;
-    static const int PRO_CPU = 0;
-    // We will try to achieve 20 FPS frame rate
-    static const int FPS = 20;
-    // We will handle web client requests every 100 ms (10 Hz)
-    static const int WSINTERVAL = 100;
+  volatile uint32_t frameNumber;
+  volatile size_t camSize;  // size of the current frame, byte
+  volatile char* camBuf;    // pointer to the current frame
+  uint8_t noActiveClients;  // number of active clients
+  // frameSync semaphore is used to prevent streaming buffer as it is replaced with the next frame
+  SemaphoreHandle_t frameSync = NULL;
 
-    // ==== STREAMING ======================================================
-    static constexpr char *HEADER = "HTTP/1.1 200 OK\r\n" \
-                          "Access-Control-Allow-Origin: *\r\n" \
-                          "Content-Type: multipart/x-mixed-replace; boundary=123456789000000000000987654321\r\n";
-    static constexpr char *BOUNDARY = "\r\n--123456789000000000000987654321\r\n";
-    static constexpr char *CTNTTYPE = "Content-Type: image/jpeg\r\nContent-Length: ";
-    static const int hdrLen = strlen(HEADER);
-    static const int bdrLen = strlen(BOUNDARY);
-    static const int cntLen = strlen(CTNTTYPE);    
-    
-    static constexpr char *JHEADER = "HTTP/1.1 200 OK\r\n" \
-                           "Content-disposition: inline; filename=capture.jpg\r\n" \
-                           "Content-type: image/jpeg\r\n\r\n";
-    static const int jhdLen = strlen(JHEADER);
+  static const int APP_CPU = 1;
+  static const int PRO_CPU = 0;
+  // We will try to achieve 20 FPS frame rate
+  static const int FPS = 20;
+  // We will handle web client requests every 100 ms (10 Hz)
+  static const int WSINTERVAL = 100;
+
+  // ==== STREAMING ======================================================
+  static constexpr char* HEADER = "HTTP/1.1 200 OK\r\n"
+                                  "Access-Control-Allow-Origin: *\r\n"
+                                  "Content-Type: multipart/x-mixed-replace; boundary=123456789000000000000987654321\r\n";
+  static constexpr char* BOUNDARY = "\r\n--123456789000000000000987654321\r\n";
+  static constexpr char* CTNTTYPE = "Content-Type: image/jpeg\r\nContent-Length: ";
+  static const int hdrLen = strlen(HEADER);
+  static const int bdrLen = strlen(BOUNDARY);
+  static const int cntLen = strlen(CTNTTYPE);
+
+  static constexpr char* JHEADER = "HTTP/1.1 200 OK\r\n"
+                                   "Content-disposition: inline; filename=capture.jpg\r\n"
+                                   "Content-type: image/jpeg\r\n\r\n";
+  static const int jhdLen = strlen(JHEADER);
 };
 
 
 struct streamInfo {
-  uint32_t            frame;
-  Esp32CamWebserver*  camServer;
-  WiFiClient          client;
-  TaskHandle_t        task;
-  char*               buffer;
-  size_t              len;
+  uint32_t frame;
+  Esp32CamWebserver* camServer;
+  WiFiClient client;
+  TaskHandle_t task;
+  char* buffer;
+  size_t len;
 };
 
 #endif

@@ -1,5 +1,5 @@
 #include "Esp32CamAsyncWebserver.h"
-    
+
 // ==== Memory allocator that takes advantage of PSRAM if present =======================
 char* Esp32CamWebserver::allocateMemory(char* aPtr, size_t aSize) {
 
@@ -7,7 +7,7 @@ char* Esp32CamWebserver::allocateMemory(char* aPtr, size_t aSize) {
   if (aPtr != NULL) free(aPtr);
 
   char* ptr = NULL;
-  ptr = (char*) malloc(aSize); // use ps_malloc if PSRAM is enabled
+  ptr = (char*)malloc(aSize);  // use ps_malloc if PSRAM is enabled
 
   // If the memory pointer is NULL, we were not able to allocate any memory, and that is a terminal condition.
   if (ptr == NULL) {
@@ -22,7 +22,7 @@ char* Esp32CamWebserver::allocateMemory(char* aPtr, size_t aSize) {
 void Esp32CamWebserver::camCB(void* pvParameters) {
 
   TickType_t xLastWakeTime;
-  Esp32CamWebserver* camServer = (Esp32CamWebserver *) pvParameters;
+  Esp32CamWebserver* camServer = (Esp32CamWebserver*)pvParameters;
 
   //  A running interval associated with currently desired frame rate
   const TickType_t xFrequency = pdMS_TO_TICKS(1000 / Esp32CamWebserver::FPS);
@@ -50,8 +50,8 @@ void Esp32CamWebserver::camCB(void* pvParameters) {
       fbs[ifb] = Esp32CamWebserver::allocateMemory(fbs[ifb], fSize[ifb]);
     }
 
-    //  Copy current frame into local buffer    
-    memcpy(fbs[ifb], (char *)fb->buf, s);
+    //  Copy current frame into local buffer
+    memcpy(fbs[ifb], (char*)fb->buf, s);
     esp_camera_fb_return(fb);
 
     //  Let other tasks run and wait until the end of the current frame rate interval (if any time left)
@@ -63,14 +63,14 @@ void Esp32CamWebserver::camCB(void* pvParameters) {
     //    xSemaphoreTake( camServer->frameSync, portMAX_DELAY );
 
     //  Do not allow frame copying while switching the current frame
-    xSemaphoreTake( camServer->frameSync, xFrequency );
+    xSemaphoreTake(camServer->frameSync, xFrequency);
     camServer->camBuf = fbs[ifb];
     camServer->camSize = s;
     ifb++;
     ifb &= 1;  // this should produce 1, 0, 1, 0, 1 ... sequence
     camServer->frameNumber++;
     //  Let anyone waiting for a frame know that the frame is ready
-    xSemaphoreGive( camServer->frameSync );
+    xSemaphoreGive(camServer->frameSync);
 
     //  Immediately let other (streaming) tasks run
     taskYIELD();
@@ -78,7 +78,7 @@ void Esp32CamWebserver::camCB(void* pvParameters) {
     //  If streaming task has suspended itself (no active clients to stream to)
     //  there is no need to grab frames from the camera. We can save some juice
     //  by suspedning the tasks
-    if ( camServer->noActiveClients == 0 ) {
+    if (camServer->noActiveClients == 0) {
       vTaskSuspend(NULL);  // passing NULL means "suspend yourself"
     }
   }
@@ -88,29 +88,29 @@ void Esp32CamWebserver::camCB(void* pvParameters) {
 // ======== Server Connection Handler Task ==========================
 void Esp32CamWebserver::mjpegCB(void* pvParameters) {
 
-  Esp32CamWebserver* camServer = (Esp32CamWebserver *) pvParameters;
+  Esp32CamWebserver* camServer = (Esp32CamWebserver*)pvParameters;
   TickType_t xLastWakeTime;
   const TickType_t xFrequency = pdMS_TO_TICKS(Esp32CamWebserver::WSINTERVAL);
 
   // Creating frame synchronization semaphore and initializing it
   camServer->frameSync = xSemaphoreCreateBinary();
-  xSemaphoreGive( camServer->frameSync );
+  xSemaphoreGive(camServer->frameSync);
 
   //=== setup section  ==================
 
   //  Creating RTOS task for grabbing frames from the camera
   int rc = xTaskCreatePinnedToCore(
-    camServer->camCB,        // callback
-    "cam",        // name
-    6 * 1024,       // stack size
-    (void *)camServer,         // parameters
-    2,            // priority
-    &camServer->tCam,        // RTOS task handle
-    Esp32CamWebserver::PRO_CPU);     // core
+    camServer->camCB,             // callback
+    "cam",                        // name
+    6 * 1024,                     // stack size
+    (void*)camServer,             // parameters
+    2,                            // priority
+    &camServer->tCam,             // RTOS task handle
+    Esp32CamWebserver::PRO_CPU);  // core
 
-  if ( rc != pdPASS ) {
+  if (rc != pdPASS) {
     log_e("mjpegCB: error creating RTOS task cam. rc = %d\n", rc);
-    log_i("handleJPGSstream: free heap  : %d\n", ESP.getFreeHeap());    
+    log_i("handleJPGSstream: free heap  : %d\n", ESP.getFreeHeap());
     vTaskDelete(NULL);
     return;
   }
@@ -130,13 +130,13 @@ void Esp32CamWebserver::mjpegCB(void* pvParameters) {
 }
 
 // ==== Actually stream content to all connected clients ========================
-void Esp32CamWebserver::streamCB(void * pvParameters) {
+void Esp32CamWebserver::streamCB(void* pvParameters) {
   char buf[16];
   TickType_t xLastWakeTime;
   TickType_t xFrequency;
 
-  streamInfo* info = (streamInfo*) pvParameters;
-  WiFiClient client = info->client;  
+  streamInfo* info = (streamInfo*)pvParameters;
+  WiFiClient client = info->client;
 
   //  Immediately send this client a header
   client.write(Esp32CamWebserver::HEADER, Esp32CamWebserver::hdrLen);
@@ -148,41 +148,39 @@ void Esp32CamWebserver::streamCB(void * pvParameters) {
 
   for (;;) {
     //  Only bother to send anything if there is someone watching
-    if ( client.connected() ) {
+    if (client.connected()) {
 
-      if ( info->frame != info->camServer->frameNumber) {
-        xSemaphoreTake( info->camServer->frameSync, portMAX_DELAY );
-        if ( info->buffer == NULL ) {
-          info->buffer = allocateMemory (info->buffer, info->camServer->camSize);
+      if (info->frame != info->camServer->frameNumber) {
+        xSemaphoreTake(info->camServer->frameSync, portMAX_DELAY);
+        if (info->buffer == NULL) {
+          info->buffer = allocateMemory(info->buffer, info->camServer->camSize);
           info->len = info->camServer->camSize;
-        }
-        else {
-          if ( info->camServer->camSize > info->len ) {
-            info->buffer = allocateMemory (info->buffer, info->camServer->camSize);
+        } else {
+          if (info->camServer->camSize > info->len) {
+            info->buffer = allocateMemory(info->buffer, info->camServer->camSize);
             info->len = info->camServer->camSize;
           }
         }
-        memcpy(info->buffer, (const void*) info->camServer->camBuf, info->len);
-        xSemaphoreGive( info->camServer->frameSync );
+        memcpy(info->buffer, (const void*)info->camServer->camBuf, info->len);
+        xSemaphoreGive(info->camServer->frameSync);
         taskYIELD();
 
         info->frame = info->camServer->frameNumber;
         client.write(Esp32CamWebserver::CTNTTYPE, Esp32CamWebserver::cntLen);
         sprintf(buf, "%d\r\n\r\n", info->len);
         client.write(buf, strlen(buf));
-        client.write((char*) info->buffer, (size_t)info->len);
+        client.write((char*)info->buffer, (size_t)info->len);
         client.write(Esp32CamWebserver::BOUNDARY, Esp32CamWebserver::bdrLen);
         client.flush();
       }
-    }
-    else {
+    } else {
       //  client disconnected - clean up.
       info->camServer->noActiveClients--;
-      log_i("streamCB: Stream Task stack wtrmark  : %d\n", uxTaskGetStackHighWaterMark(info->task));      
+      log_i("streamCB: Stream Task stack wtrmark  : %d\n", uxTaskGetStackHighWaterMark(info->task));
       client.flush();
       client.stop();
-      if ( info->buffer ) {
-        free( info->buffer );
+      if (info->buffer) {
+        free(info->buffer);
         info->buffer = NULL;
       }
       delete info;
@@ -196,43 +194,42 @@ void Esp32CamWebserver::streamCB(void * pvParameters) {
 }
 
 WebServer* Esp32CamWebserver::start(camera_config_t cameraConfig) {
-    memset(&_camConfig, 0, sizeof(_camConfig));
-    memcpy(&_camConfig, &cameraConfig, sizeof(cameraConfig));
+  memset(&_camConfig, 0, sizeof(_camConfig));
+  memcpy(&_camConfig, &cameraConfig, sizeof(cameraConfig));
 
-    esp_err_t err = esp_camera_init(&_camConfig);
-    if (err != ESP_OK) {
-        return NULL;
-    }
-
-    log_i("Camera was iniitalized");
-    
-    // Start mainstreaming RTOS task
-    int rc = xTaskCreatePinnedToCore(
-      this->mjpegCB,
-      "mjpeg",
-      4 * 1024,
-      this,
-      2,
-      &this->tMjpeg,
-      Esp32CamWebserver::APP_CPU
-    );  
-
-  if ( rc != pdPASS ) {
-    log_e("start: error creating RTOS task mjpegCB. rc = %d\n", rc);
-    log_i("handleJPGSstream: free heap  : %d\n", ESP.getFreeHeap());    
+  esp_err_t err = esp_camera_init(&_camConfig);
+  if (err != ESP_OK) {
+    return NULL;
   }
-      
-    this->webserver->on("/mjpeg/1", HTTP_GET, std::bind(&Esp32CamWebserver::handleMjpeg, this));
-    this->webserver->on("/jpg", HTTP_GET, std::bind(&Esp32CamWebserver::handleJpg, this));
-    this->webserver->onNotFound(std::bind(&Esp32CamWebserver::handleNotFound, this));
-    this->webserver->begin();
 
-    return this->webserver;  
+  log_i("Camera was iniitalized");
+
+  // Start mainstreaming RTOS task
+  int rc = xTaskCreatePinnedToCore(
+    this->mjpegCB,
+    "mjpeg",
+    4 * 1024,
+    this,
+    2,
+    &this->tMjpeg,
+    Esp32CamWebserver::APP_CPU);
+
+  if (rc != pdPASS) {
+    log_e("start: error creating RTOS task mjpegCB. rc = %d\n", rc);
+    log_i("handleJPGSstream: free heap  : %d\n", ESP.getFreeHeap());
+  }
+
+  this->webserver->on("/mjpeg/1", HTTP_GET, std::bind(&Esp32CamWebserver::handleMjpeg, this));
+  this->webserver->on("/jpg", HTTP_GET, std::bind(&Esp32CamWebserver::handleJpg, this));
+  this->webserver->onNotFound(std::bind(&Esp32CamWebserver::handleNotFound, this));
+  this->webserver->begin();
+
+  return this->webserver;
 }
 
 // ==== Handle connection request from clients ===============================
 void Esp32CamWebserver::handleMjpeg(void) {
-  if ( this->noActiveClients >= MAX_CLIENTS ) return;
+  if (this->noActiveClients >= MAX_CLIENTS) return;
   log_i("handleMjpeg start: free heap  : %d\n", ESP.getFreeHeap());
 
   streamInfo* info = new streamInfo;
@@ -245,14 +242,14 @@ void Esp32CamWebserver::handleMjpeg(void) {
 
   //  Creating task to push the stream to all connected clients
   int rc = xTaskCreatePinnedToCore(
-             this->streamCB,
-             "strmCB",
-             4 * 1024,
-             (void*) info,
-             2,
-             &info->task,
-             Esp32CamWebserver::APP_CPU);
-  if ( rc != pdPASS ) {
+    this->streamCB,
+    "strmCB",
+    4 * 1024,
+    (void*)info,
+    2,
+    &info->task,
+    Esp32CamWebserver::APP_CPU);
+  if (rc != pdPASS) {
     log_e("handleMjpeg: error creating RTOS task streamCB. rc = %d\n", rc);
     log_i("handleMjpeg: free heap  : %d\n", ESP.getFreeHeap());
     //    Serial.printf("stk high wm: %d\n", uxTaskGetStackHighWaterMark(tSend));
@@ -262,12 +259,11 @@ void Esp32CamWebserver::handleMjpeg(void) {
   this->noActiveClients++;
 
   // Wake up streaming tasks, if they were previously suspended:
-  if ( eTaskGetState( this->tCam ) == eSuspended ) vTaskResume( this->tCam );
+  if (eTaskGetState(this->tCam) == eSuspended) vTaskResume(this->tCam);
 }
 
 // ==== Serve up one JPEG frame =============================================
-void Esp32CamWebserver::handleJpg(void)
-{
+void Esp32CamWebserver::handleJpg(void) {
   WiFiClient client = this->webserver->client();
 
   if (!client.connected()) return;
@@ -277,9 +273,8 @@ void Esp32CamWebserver::handleJpg(void)
   esp_camera_fb_return(fb);
 }
 
-void Esp32CamWebserver::handleNotFound(void)
-{    
-  this->webserver->send(404, "text/plain", "404: Not found"); // Send HTTP status 404 (Not Found) when there's no handler for the URI in the request
+void Esp32CamWebserver::handleNotFound(void) {
+  this->webserver->send(404, "text/plain", "404: Not found");  // Send HTTP status 404 (Not Found) when there's no handler for the URI in the request
 }
 
 void Esp32CamWebserver::run(void) {
